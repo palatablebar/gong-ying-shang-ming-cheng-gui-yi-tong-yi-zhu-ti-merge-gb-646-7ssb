@@ -20,6 +20,7 @@ from .modules.m3_blocks import service as block_service
 from .modules.m4_pairs import service as pair_service
 from .modules.m5_clusters import service as cluster_service
 from .modules.m6_reviews import service as review_service
+from .modules.m8_payment import service as payment_service
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
@@ -30,6 +31,7 @@ NAV = (
     ("pairs", "候选对", "/pairs"),
     ("clusters", "合并簇", "/clusters"),
     ("reviews", "复核", "/reviews"),
+    ("payment", "付款", "/payment"),
     ("export", "导出", "/export"),
 )
 
@@ -220,6 +222,19 @@ def page_reviews(request: Request):
         "runs": run_briefs(8),
     })
     return render(request, "reviews.html", context)
+
+
+@router.get("/payment", response_class=HTMLResponse)
+def page_payment(request: Request):
+    run = current_run()
+    run_id = run["run_id"]
+    items = payment_service.payment_list(run_id)
+    context = base_context(request, "payment", "付款链路", run)
+    context.update({
+        "items": items[:80],
+        "stats": payment_service.summary(run_id),
+    })
+    return render(request, "payment.html", context)
 
 
 @router.get("/export", response_class=HTMLResponse)

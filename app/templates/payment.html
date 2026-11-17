@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block body %}
+<section class="panel">
+  <div class="panel-head">
+    <h1 class="panel-title">付款链路</h1>
+    <div class="panel-num">第 {{ stats.generation }} 代 · {{ stats.total }} 条 · 直付 {{ stats.direct }} · 收敛 {{ stats.resolved }} · 挂起 {{ stats.halted }} · 落定 {{ stats.settled }}</div>
+    <button type="button" class="btn btn-sm" data-action="rebuild-payment">重算收敛</button>
+    <a class="btn btn-link" href="/api/export/payment.csv" download>付款 CSV</a>
+  </div>
+  {% if stats.halted %}
+  <p class="empty">挂起 {{ stats.halted }} 条、金额 {{ stats.halted_amount|money }} 元：停在最后已核节点，待复核确认后方可付款。</p>
+  {% endif %}
+  {% if items %}
+  <table class="tbl">
+    <thead><tr><th>供应商</th><th>声明主档</th><th>状态</th><th>收款主体</th><th>链路证据</th><th>未决原因</th><th class="num">本年累计(元)</th><th>复核</th></tr></thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td class="clip" title="{{ item.raw_name }}"><span class="mono">{{ item.supplier_id }}</span> {{ item.raw_name }}</td>
+        <td class="mono">{{ item.ref_master_id or '—' }}</td>
+        <td>
+          {% if item.status == 'halted' %}<span class="tag tag-bad">{{ item.status_label }}</span>
+          {% elif item.status == 'settled' %}<span class="tag tag-warn">{{ item.status_label }}</span>
+          {% else %}<span class="tag tag-ok">{{ item.status_label }}</span>{% endif %}
+        </td>
+        <td class="clip" title="{{ item.payee_name }}">
+          {% if item.payee_id %}
+          <span class="mono">{{ item.payee_id }}</span> {{ item.payee_name }}
+          <span class="sub mono">{{ item.payee_tax or '无税号' }} · {{ item.payee_cluster_id }}</span>
+          {% else %}<span class="tag tag-bad">无已核节点</span>{% endif %}
+        </td>
+        <td class="mono clip" title="{% for edge in item.chain %}{{ edge.from }} -> {{ edge.to }}{% if not loop.last %} / {% endif %}{% endfor %}">
+          {% if item.chain %}{{ item.supplier_id }}{% for edge in item.chain %} → {{ edge.to }}{% endfor %}{% else %}—{% endif %}
+        </td>
+        <td>
+          {% if item.reason_code %}
+          <span class="mono">{{ item.reason_code }}</span> {{ reasons.get(item.reason_code) }}
+          <span class="sub mono">{{ item.detail }}</span>
+          {% else %}—{% endif %}
+        </td>
+        <td class="num">{{ item.ytd_amount|money }}</td>
+        <td class="btn-cell">
+          {% if item.status == 'halted' and item.edge_key %}
+          <button type="button" class="btn btn-sm" data-ref-decision="verify" data-supplier="{{ item.supplier_id }}" data-version="{{ item.edge_version }}">确认落定</button>
+          <button type="button" class="btn btn-sm btn-ghost" data-ref-decision="hold" data-supplier="{{ item.supplier_id }}" data-version="{{ item.edge_version }}">维持拦截</button>
+          {% elif item.status == 'settled' %}<span class="sub">已核 v{{ item.edge_version }}</span>
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">没有付款记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

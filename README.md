@@ -15,7 +15,10 @@
 - 合并簇：并查集合并，代表元取税号最小者，簇内税号冲突标记交复核，
   簇金额与成员分摊用 Decimal 逐分守恒。
 - 复核：队列按得分降序，决定带版本乐观锁，写入后簇立即重算；引用异常四类可查。
-- 导出：主数据、成员分摊、隔离区、冲突、运行清单（含 `run_id` 与输入 sha256）。
+- 付款链路：引用链逐跳核验，可穿透时收敛到最终主档（末端簇代表元），
+  断链、自引、成环、落点簇冲突时停在最后已核节点并生成待办；
+  收敛结果按代落库、一次性切换，失败保留旧路径，同批重跑不重复待办、不改已核路径。
+- 导出：主数据、成员分摊、付款清单、隔离区、冲突、运行清单（含 `run_id` 与输入 sha256）。
 
 ## 模块清单
 
@@ -28,11 +31,12 @@
 | M5 等价类合并 | `POST /api/clusters` | 并查集、代表元、最大余额分摊 |
 | M6 复核批次 | `POST /api/reviews/{pair_id}/decision` | 队列、版本锁、引用一致性 |
 | M7 主数据导出 | `GET /api/export/master.csv` | CSV 与运行清单，UTF-8 BOM |
+| M8 付款链路 | `GET /api/payment` | 链式收敛、最后已核节点、按代原子切换 |
 
 ## 页面
 
 `/` 台账总览（含采信诊断与隔离区）、`/normalize` 名称归一、`/pairs` 候选对、
-`/clusters` 合并簇、`/reviews` 复核队列、`/export` 主数据导出。
+`/clusters` 合并簇、`/reviews` 复核队列、`/payment` 付款链路、`/export` 主数据导出。
 接口文档在 `/docs`。
 
 ## 核心规则
@@ -42,6 +46,8 @@
 3. 判定优先级：税号冲突（拒绝） > 税号相同（自动） > 城市不同（复核） > 得分分档。
 4. 代表元 = 簇内税号最小者；无税号取供应商号最小者。
 5. 簇金额 = Σ成员金额（Decimal）；成员分摊按比例取整到分后最大余额补齐。
+6. 引用链每跳目标存在、非自引、不成环即可穿透；走到无引用末端且末端簇无税号冲突，
+   收敛到末端簇代表元；否则停在最后已核节点（断点回退的第一个无冲突簇节点）挂起待核。
 
 字段类型、单位、空值与哨兵、时间与区间定义见 `docs/DATA-DICTIONARY.md`；
 陷阱清单与对账规则见 `docs/DEPTH.md`；运维动作见 `docs/RUNBOOK.md`。
@@ -65,7 +71,9 @@ docker compose exec -T app python -m pytest -q
 4. `/pairs`：按结论过滤候选对，看得分与依据字段。
 5. `/clusters`：合并簇与成员分摊，`C-0009` 标税号冲突。
 6. `/reviews`：三项带复核，判定后簇数立即变化；引用异常五条。
-7. `/export`：下载主数据、成员分摊、隔离区、冲突与运行清单。
+7. `/payment`：付款清单 70 条，22 条链式收敛到最终主档、8 条挂起待核，
+   对断点边确认落定后重跑不再改变。
+8. `/export`：下载主数据、成员分摊、付款清单、隔离区、冲突与运行清单。
 
 ## 测试
 
@@ -73,16 +81,16 @@ docker compose exec -T app python -m pytest -q
 docker compose exec -T app python -m pytest -q
 ```
 
-81 条测试：每个模块 8 到 13 条，另有端到端 4 条与不变量 5 条。
+96 条测试：每个模块 8 到 15 条，另有端到端 4 条与不变量 5 条。
 
 ## 目录
 
 ```text
 app/main.py config.py errors.py reasons.py manifest.py store.py web.py
-app/modules/m1_intake … m7_export/{handler.py service.py 规则与读写出}
-app/templates/{base.html + 6 页}
+app/modules/m1_intake … m8_payment/{handler.py service.py 规则与读写出}
+app/templates/{base.html + 7 页}
 app/static/{theme.css layout.css components.css app.js table.js charts.js}
 docs/{DEPTH.md DATA-DICTIONARY.md RUNBOOK.md}
 sample_data/ 六个脏样例
-tests/{conftest.py test_intake … test_export.py test_e2e.py test_invariants.py fixtures/}
+tests/{conftest.py test_intake … test_payment.py test_e2e.py test_invariants.py fixtures/}
 ```

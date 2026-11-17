@@ -66,7 +66,24 @@
           return postJson('/api/suppliers/import', { force: true })
             .then(function () { window.location.reload(); });
         }
+        if (name === 'rebuild-payment') {
+          return postJson('/api/payment/resolve', {})
+            .then(function () { window.location.reload(); });
+        }
         return Promise.resolve();
+      });
+      return;
+    }
+
+    var refDecision = event.target.closest('[data-ref-decision]');
+    if (refDecision) {
+      var supplierId = refDecision.getAttribute('data-supplier');
+      var edgeVersion = parseInt(refDecision.getAttribute('data-version'), 10);
+      run(refDecision, function () {
+        return postJson('/api/payment/' + encodeURIComponent(supplierId) + '/decision', {
+          decision: refDecision.getAttribute('data-ref-decision'),
+          expected_version: edgeVersion
+        }).then(function () { window.location.reload(); });
       });
       return;
     }

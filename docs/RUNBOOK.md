@@ -24,13 +24,17 @@ docker compose up -d --build
 - 批次号由输入摘要（按文件名排序的 sha256 拼接）与规则版本共同决定，同一批文件得到同一个 `run_id`；
   命中已有批次时直接复用结果，不新增记录。
 - 复核决定写入后，簇与金额会立即重算，不需要手工触发。
+- 付款收敛 `POST /api/payment/resolve` 可反复调用：内容相同则不切换代、不新增待办；
+  断点边的 verify/hold 决定不随重算清除，已核路径不会被重跑改变。
 
 ## 常用请求
 
 ```bash
 curl -s -X POST http://127.0.0.1:18205/api/suppliers/import -H 'Content-Type: application/json' -d '{}'
 curl -s http://127.0.0.1:18205/api/reconcile
+curl -s http://127.0.0.1:18205/api/payment
 curl -s http://127.0.0.1:18205/api/export/master.csv -o master.csv
+curl -s http://127.0.0.1:18205/api/export/payment.csv -o payment.csv
 curl -s http://127.0.0.1:18205/api/export/manifest.json -o manifest.json
 ```
 
@@ -42,6 +46,14 @@ curl -s -X POST http://127.0.0.1:18205/api/reviews/P-00105/decision \
   -d '{"decision":"merge","expected_version":0}'
 ```
 
+确认一条付款断点边（落定在最后已核节点）：
+
+```bash
+curl -s -X POST http://127.0.0.1:18205/api/payment/S-0053/decision \
+  -H 'Content-Type: application/json' \
+  -d '{"decision":"verify","expected_version":0}'
+```
+
 ## 失败码处理
 
 | 原因码 | 处理 |
@@ -51,8 +63,11 @@ curl -s -X POST http://127.0.0.1:18205/api/reviews/P-00105/decision \
 | `E_DECODE_FAILED` | 文件既非 UTF-8 也非 GB18030，需转码 |
 | `Q_ROW_SHORT` / `Q_ROW_LONG` | 该行进隔离区，修正分隔符后重跑 |
 | `V_STALE_DECISION` | 页面停留过久，刷新后按新版本再提交 |
-| `V_BAD_DECISION` | 税号冲突的候选对不允许合并 |
+| `V_BAD_DECISION` | 税号冲突的候选对不允许合并；付款断点边只接受 verify/hold |
 | `V_UNKNOWN_PAIR` | 候选对编号不属于当前批次，刷新页面 |
+| `V_UNKNOWN_RECORD` | 供应商号不属于当前批次，刷新付款页 |
+| `V_NO_PENDING_EDGE` | 该记录没有未决断点（直付、已收敛或簇冲突待解），无需边决定 |
+| `R_SWITCH_INVALID` | 收敛校验未过，已自动保留旧路径；检查簇与记录是否完整后重算 |
 
 ## 测试
 

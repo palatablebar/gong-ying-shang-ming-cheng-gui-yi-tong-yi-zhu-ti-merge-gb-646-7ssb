@@ -1,10 +1,12 @@
 # 深度登记 供应商主数据台账（gb-646 entitymerge）
 
-- 规模：中型（7 个功能模块，78 个文件，81 条测试）
+- 规模：中型（8 个功能模块，84 个文件，96 条测试）
 - 核心规则：名称归一后按 2-gram 分块，相似度 = 0.55 × bigram Dice + 0.45 × 编辑比率；
-  税号不同为硬冲突禁止合并，税号相同强制合并；并查集合并，代表元取税号最小者
+  税号不同为硬冲突禁止合并，税号相同强制合并；并查集合并，代表元取税号最小者；
+  付款引用链可穿透时收敛到末端簇代表元，不可穿透时停在最后已核节点
 - 使用者与工作流：集团采购中心主数据岗，每月收 6 个 ERP 导出的供应商名录，
-  逐份采信、看隔离、判定候选对、生成合并簇、人工复核边界对、导出主数据与证据
+  逐份采信、看隔离、判定候选对、生成合并簇、人工复核边界对、月底按付款清单付款、
+  导出主数据与证据
 
 ## 功能模块
 
@@ -17,6 +19,7 @@
 | M5 等价类合并 | 生成合并簇，核对代表元与金额 | POST /api/clusters | `app/modules/m5_clusters/unionfind.py` `app/modules/m5_clusters/represent.py` `app/modules/m5_clusters/allocate.py` `app/modules/m5_clusters/service.py` `app/modules/m5_clusters/handler.py` | `tests/test_clusters.py` |
 | M6 复核批次 | 判定边界对，看引用异常与批次历史 | POST /api/reviews/{pair_id}/decision | `app/modules/m6_reviews/queue.py` `app/modules/m6_reviews/history.py` `app/modules/m6_reviews/version.py` `app/modules/m6_reviews/service.py` `app/modules/m6_reviews/handler.py` | `tests/test_reviews.py` |
 | M7 主数据导出 | 下载主数据、成员分摊、隔离区与运行清单 | GET /api/export/master.csv | `app/modules/m7_export/master_out.py` `app/modules/m7_export/quarantine_out.py` `app/modules/m7_export/manifest_out.py` `app/modules/m7_export/service.py` `app/modules/m7_export/handler.py` | `tests/test_export.py` |
+| M8 付款链路 | 看每条记录的收款主体、链路证据与未决原因，确认或拦截断点边 | GET /api/payment · POST /api/payment/{supplier_id}/decision | `app/modules/m8_payment/chain.py` `app/modules/m8_payment/service.py` `app/modules/m8_payment/payment_out.py` `app/modules/m8_payment/handler.py` | `tests/test_payment.py` |
 
 ## 陷阱登记
 
@@ -35,12 +38,17 @@
 | TRAP-22 | 同一主体多个别名 | 合并顺序不同得到不同簇 | 并查集根取字典序较小者，代表元规则固定 | `app/modules/m5_clusters/unionfind.py` `app/modules/m5_clusters/represent.py` | `tests/test_clusters.py::test_merge_order_independent` |
 | TRAP-24 | 簇金额按比例分摊到成员 | 各自四舍五入后合计不等 | 最大余额法分到 0.01，同分按供应商号 | `app/modules/m5_clusters/allocate.py` | `tests/test_clusters.py::test_share_largest_remainder` |
 | TRAP-26 | 复核决定被旧页面重复提交 | 后提交无条件覆盖新决定 | 版本乐观锁，expected_version 不符即 409 | `app/modules/m6_reviews/version.py` | `tests/test_reviews.py::test_stale_decision_rejected` |
+| TRAP-27 | A 指 B、B 再指 C 的链式引用 | 直接穿透把款送到最后主体，或逐级拦截把稳定账户当非主档拦下 | 每跳有效即可穿透到末端簇代表元；断链、自引、成环、落点簇冲突时停在最后已核节点挂起，人工 verify 后落定 | `app/modules/m8_payment/chain.py` | `tests/test_payment.py::test_multi_hop_chain_converges` `tests/test_payment.py::test_halt_at_last_verified_node` |
+| TRAP-28 | 付款收敛重算与导出并发 | 导出到一半换结果，页面与 CSV 不一致 | 收敛按代落库，单事务校验后一次性切换指针，失败保留旧代；页面与导出只读生效代 | `app/store.py` `app/modules/m8_payment/service.py` | `tests/test_payment.py::test_atomic_switch_keeps_old_on_failure` `tests/test_payment.py::test_export_matches_page` |
+| TRAP-29 | 同批重跑生成重复待办、已核路径被冲掉 | 每次重算都新增待办行或清空人工决定 | 内容相同不切换不新增；断点边决定独立成表不随重算清除，已核路径由决定驱动 | `app/modules/m8_payment/service.py` | `tests/test_payment.py::test_idempotent_rerun_no_duplicate_todos` `tests/test_payment.py::test_verify_settles_and_survives_rerun` |
 
 ## 对账规则
 
 - 记录：采信行数 = 采纳 + 隔离 + 同号冲突；采纳 = 主体数 + 合并成员数
 - 金额：Σ采纳记录金额 = Σ簇金额 = Σ成员分摊，全部 Decimal 逐分相等
 - 候选对：候选总数 = 自动 + 复核 + 拒绝；复核决定写入后簇与金额立即重算
+- 付款链路：每条采纳记录恰一行收敛结果；直付 + 收敛 + 挂起 + 落定 = 记录数；
+  挂起金额合计单独给出，付款页与付款 CSV 读同一生效代
 - 空态：仅表头 / 全空行 / 正常文件三种结论分别记录在文件诊断里
 
 ## 已知不覆盖
@@ -48,5 +56,6 @@
 - 生产规模 8400 条未做压测；样例 73 行，分块桶上限 120、候选上限 4000 以外的桶只计数不展开
 - 税号只做字符串比较，未校验 18 位统一社会信用代码的校验位
 - 银行账号仅作为证据字段参与展示，未做账户一致性核验
-- 复核决定只支持合并与保留，未提供拆分已合并簇的能力
+- 复核决定只支持合并与保留，未提供拆分已合并簇的能力；
+  因此落在税号冲突簇上的付款只能等冲突解除，断点边决定不能越过簇冲突
 - 导出为单次全量 CSV，未做分页或增量下载

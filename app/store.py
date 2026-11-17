@@ -113,13 +113,43 @@ SCHEMA = (
         decided_at TEXT NOT NULL,
         PRIMARY KEY (run_id, pair_id)
     )""",
+    """CREATE TABLE IF NOT EXISTS ref_decisions (
+        run_id TEXT NOT NULL,
+        edge_key TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        expected_version INTEGER NOT NULL,
+        version INTEGER NOT NULL,
+        operator TEXT NOT NULL,
+        decided_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, edge_key)
+    )""",
+    """CREATE TABLE IF NOT EXISTS resolutions (
+        run_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        supplier_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payee_id TEXT NOT NULL DEFAULT '',
+        payee_cluster_id TEXT NOT NULL DEFAULT '',
+        chain_json TEXT NOT NULL DEFAULT '[]',
+        reason_code TEXT NOT NULL DEFAULT '',
+        detail TEXT NOT NULL DEFAULT '',
+        edge_key TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (run_id, generation, supplier_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS resolution_switch (
+        run_id TEXT PRIMARY KEY,
+        active_generation INTEGER NOT NULL,
+        switched_at TEXT NOT NULL
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_records_run ON records(run_id)",
     "CREATE INDEX IF NOT EXISTS idx_quarantine_run ON quarantine(run_id)",
     "CREATE INDEX IF NOT EXISTS idx_pairs_run ON pair_scores(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_resolutions_run ON resolutions(run_id, generation)",
 )
 
 TABLES = ("runs", "records", "quarantine", "conflicts", "blocks", "block_pairs",
-          "pair_scores", "clusters", "cluster_members", "decisions")
+          "pair_scores", "clusters", "cluster_members", "decisions",
+          "ref_decisions", "resolutions", "resolution_switch")
 
 
 def db_path() -> Path:
@@ -413,3 +443,99 @@ def count(run_id: str, table: str) -> int:
     with connect() as conn:
         row = conn.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE run_id = ?", (run_id,)).fetchone()
         return int(row["n"])
+
+
+# ---- 付款链路收敛 ----
+
+def get_ref_decision(run_id: str, edge_key: str):
+    with connect() as conn:
+        return _one(conn, "SELECT * FROM ref_decisions WHERE run_id = ? AND edge_key = ?",
+                    (run_id, edge_key))
+
+
+def list_ref_decisions(run_id: str) -> list:
+    with connect() as conn:
+        return _rows(conn, "SELECT * FROM ref_decisions WHERE run_id = ?"
+                           " ORDER BY edge_key", (run_id,))
+
+
+def save_ref_decision(decision: dict) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO ref_decisions (run_id, edge_key, decision,"
+            " expected_version, version, operator, decided_at) VALUES (?,?,?,?,?,?,?)",
+            (decision["run_id"], decision["edge_key"], decision["decision"],
+             decision["expected_version"], decision["version"], decision["operator"],
+             decision["decided_at"]),
+        )
+        conn.commit()
+
+
+def active_generation(run_id: str) -> int:
+    """当前生效的收敛代；从未切换过时为 0。"""
+    with connect() as conn:
+        row = conn.execute("SELECT active_generation FROM resolution_switch WHERE run_id = ?",
+                           (run_id,)).fetchone()
+        return int(row["active_generation"]) if row else 0
+
+
+def list_resolutions(run_id: str, generation: int = 0) -> list:
+    """读取指定代的收敛结果；缺省读当前生效代，页面与导出共用同一结果。"""
+    gen = generation or active_generation(run_id)
+    if not gen:
+        return []
+    with connect() as conn:
+        return _rows(conn, "SELECT * FROM resolutions WHERE run_id = ? AND generation = ?"
+                           " ORDER BY supplier_id", (run_id, gen))
+
+
+def switch_resolutions(run_id: str, rows, switched_at: str) -> int:
+    """一次性切换：单事务内校验、替换、拨指针；任一步失败回滚，旧路径保留。"""
+    from .errors import DomainError
+    from .reasons import R_SWITCH_INVALID
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            record_ids = {row["supplier_id"] for row in conn.execute(
+                "SELECT supplier_id FROM records WHERE run_id = ?", (run_id,)).fetchall()}
+            rep_ids = {row["rep_id"] for row in conn.execute(
+                "SELECT rep_id FROM clusters WHERE run_id = ?", (run_id,)).fetchall()}
+            seen = set()
+            for row in rows:
+                supplier_id = row["supplier_id"]
+                if supplier_id in seen or supplier_id not in record_ids:
+                    raise DomainError(R_SWITCH_INVALID, f"覆盖异常 {supplier_id}", 500)
+                seen.add(supplier_id)
+                if row["status"] in ("direct", "resolved", "settled"):
+                    if not row["payee_id"] or row["payee_id"] not in rep_ids:
+                        raise DomainError(R_SWITCH_INVALID, f"收款主体非法 {supplier_id}", 500)
+                elif row["status"] == "halted":
+                    if not row["reason_code"]:
+                        raise DomainError(R_SWITCH_INVALID, f"挂起缺原因 {supplier_id}", 500)
+                else:
+                    raise DomainError(R_SWITCH_INVALID, f"状态非法 {row['status']}", 500)
+            if seen != record_ids:
+                raise DomainError(R_SWITCH_INVALID,
+                                  f"覆盖 {len(seen)}/{len(record_ids)}", 500)
+            pointer = conn.execute("SELECT active_generation FROM resolution_switch"
+                                   " WHERE run_id = ?", (run_id,)).fetchone()
+            generation = (int(pointer["active_generation"]) if pointer else 0) + 1
+            conn.execute("DELETE FROM resolutions WHERE run_id = ?", (run_id,))
+            conn.executemany(
+                "INSERT INTO resolutions (run_id, generation, supplier_id, status, payee_id,"
+                " payee_cluster_id, chain_json, reason_code, detail, edge_key)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [(run_id, generation, row["supplier_id"], row["status"], row["payee_id"],
+                  row["payee_cluster_id"], row["chain_json"], row["reason_code"],
+                  row["detail"], row["edge_key"]) for row in rows],
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO resolution_switch (run_id, active_generation,"
+                " switched_at) VALUES (?,?,?)",
+                (run_id, generation, switched_at),
+            )
+            conn.commit()
+            return generation
+        except Exception:
+            conn.rollback()
+            raise
